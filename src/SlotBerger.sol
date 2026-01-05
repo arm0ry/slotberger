@@ -8,8 +8,8 @@ struct Slot {
     uint256 price; // provided by user
     uint256 deposit; // provided by user
     address user; // provided by user
-    uint40 timeLastTaxCollected; // automated by contract
-    address currency; // accepted by DAO
+    uint40 timeTaxLastCollected; // automated by contract
+    address currency; // provided by DAO
     uint40 timeLastSlotted; // automated by contract
 }
 
@@ -46,13 +46,13 @@ contract SlotBerger {
     /// @dev Address authorized to `collect` and `pull`.
     address public dao;
 
-    /// @dev Percentage of patronage.
+    /// @dev Percentage of ad price to collect as tax, e.g., 100 / 10000
     uint40 public tax;
 
-    /// @dev Bidding cycle.
+    /// @dev Bidding cycle in seconds.
     uint40 public cycle;
 
-    /// @dev Minimum increase per use.
+    /// @dev Minimum increase required to `use()` a slot.
     uint40 public minimum;
 
     /// @dev Id for slot.
@@ -71,13 +71,16 @@ contract SlotBerger {
     constructor(address _dao) {
         dao = _dao;
 
+        /// @dev Auto-accept ether as payment method.
         accepted[address(0)] = true;
 
+        /// @dev Hardcoding for demo purposes. You may customize it.
         tax = 100; // 100 / 10000
-        cycle = 1 minutes; // cycle
-        // minimum = 0; // minimum increase per change of hand
+        cycle = 1 minutes;
+        // minimum = 0; // minimum rate of increase per purchase
     }
 
+    /// @dev Modifier to check if `msg.sender` is `dao`.
     modifier authorized() {
         if (msg.sender != dao) revert Unauthorized();
         _;
@@ -88,7 +91,7 @@ contract SlotBerger {
     /* -------------------------------------------------------------------------- */
 
     /// @dev Use a slot.
-    function commit(
+    function use(
         uint256 id,
         string calldata content,
         address currency,
@@ -131,7 +134,7 @@ contract SlotBerger {
             if ($.currency != currency) revert InvalidCurrency();
 
             // Calculate collection for buyout.
-            uint256 collection = patronageOwed(id);
+            uint256 collection = taxToCollect($.price, $.timeTaxLastCollected);
 
             // Take collection.
             route(currency, address(this), dao, collection);
@@ -150,39 +153,54 @@ contract SlotBerger {
         address currency,
         uint256 newPrice
     ) internal {
-        slots[id].content = content;
-        slots[id].price = newPrice;
-        slots[id].deposit = msg.value;
-        slots[id].user = msg.sender;
-        slots[id].currency = currency;
-
-        slots[id].timeLastSlotted = uint40(block.timestamp);
-        slots[id].timeLastTaxCollected = uint40(block.timestamp);
+        // Set slot.
+        slots[id] = Slot({
+            content: content,
+            price: newPrice,
+            deposit: msg.value,
+            user: msg.sender,
+            currency: currency,
+            timeLastSlotted: uint40(block.timestamp),
+            timeTaxLastCollected: uint40(block.timestamp)
+        });
 
         emit Slotted(id, newPrice, content);
     }
 
     /* -------------------------------------------------------------------------- */
-    /*                                 Get a Slot.                                */
+    /*                           Public Functions.                                */
     /* -------------------------------------------------------------------------- */
 
+    /// @dev Retrieve the contents of a slot.
     function getSlot(uint256 id) public view returns (Slot memory) {
         return slots[id];
+    }
+
+    /// @dev Public function to calculate amount of tax to collect.
+    // credit: simondlr  https://github.com/simondlr/thisartworkisalwaysonsale/blob/master/packages/hardhat/contracts/v1/ArtStewardV2.sol
+    function taxToCollect(
+        uint256 price,
+        uint256 timeTaxLastCollected
+    ) public view returns (uint256) {
+        return
+            ((price * (block.timestamp - timeTaxLastCollected)) * tax) /
+            10000 /
+            365 days;
     }
 
     /* -------------------------------------------------------------------------- */
     /*                                    DAO.                                    */
     /* -------------------------------------------------------------------------- */
 
-    /// @dev Collect any patronage owed by a given `Slot`.
+    /// @dev Collect any tax owed from a slot.
     function collect(
         uint256 id
     ) public payable authorized returns (uint256, uint256) {
-        uint256 collection = patronageOwed(id);
         Slot memory $ = slots[id];
+        uint256 collection = taxToCollect($.price, $.timeTaxLastCollected);
 
         if (collection > 0) {
-            slots[id].timeLastTaxCollected = uint40(block.timestamp);
+            slots[id].timeTaxLastCollected = uint40(block.timestamp);
 
             if (collection >= $.deposit) {
                 // Foreclose.
@@ -201,15 +219,15 @@ contract SlotBerger {
         }
     }
 
-    /// @dev Pull a given `Slot`.
+    /// @dev Pull a given slot by id.
     function pull(uint256 id) public payable authorized {
         Slot memory $ = slots[id];
 
-        // Delete slot.
-        delete slots[id];
-
         // Make collection, if any.
         (, uint256 refund) = collect(id);
+
+        // Delete slot.
+        delete slots[id];
 
         // Refund.
         if (refund > 0) {
@@ -218,10 +236,12 @@ contract SlotBerger {
         }
     }
 
+    /// @dev Permissioned function to set `dao`.
     function setDao(address _dao) public payable authorized {
         dao = _dao;
     }
 
+    /// @dev Permissioned function to manage slot properties.
     function manageSetting(
         uint40 _tax,
         uint40 _cycle,
@@ -232,6 +252,7 @@ contract SlotBerger {
         minimum = _minimum;
     }
 
+    /// @dev Permissioned function to set an accepted currency.
     function manageCurrency(
         address currency,
         bool status
@@ -243,19 +264,7 @@ contract SlotBerger {
     /*                                   Helper.                                  */
     /* -------------------------------------------------------------------------- */
 
-    /// @dev Helper function to calculate patronage owed.
-    // credit: simondlr  https://github.com/simondlr/thisartworkisalwaysonsale/blob/master/packages/hardhat/contracts/v1/ArtStewardV2.sol
-    function patronageOwed(
-        uint256 id
-    ) public view returns (uint256 patronageDue) {
-        Slot memory $ = slots[id];
-
-        return
-            (($.price * (block.timestamp - $.timeLastTaxCollected)) * tax) /
-            10000 /
-            365 days;
-    }
-
+    /// @dev Helper function to route ether and ERC20 tokens.
     function route(
         address currency,
         address from,
