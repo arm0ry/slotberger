@@ -1,19 +1,42 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 pragma solidity >=0.8.4;
 
-import {IERC20} from "lib/forge-std/src/interfaces/IERC20.sol";
+interface IERC20 {
+    function transferFrom(
+        address from,
+        address to,
+        uint256 amount
+    ) external returns (bool);
+}
+
+// import {IERC20} from "lib/forge-std/src/interfaces/IERC20.sol";
 
 struct Slot {
     string content; // provided by user
     uint256 price; // provided by user
-    uint256 deposit; // provided by user
-    address user; // provided by user
-    uint40 timeTaxLastCollected; // automated by contract
-    address currency; // provided by DAO
-    uint40 timeLastSlotted; // automated by contract
+    address owner; // provided by user
+    bool paused; // provided by user
+    bool pending;
+    address currency; // provided by user
+    uint8 tax; // provided by user
+    uint40 term; // provided by user
+    uint40 remainingTime;
+    address user; // automated by contract
+    uint40 lastTimestamp;
+    uint256 deposit;
+}
+
+struct Bid {
+    uint256 price; // provided by user
+    uint256 deposit;
+    address currency; // provided by user
+    address user; // automated by contract
+    uint40 remainingTime;
+    uint40 lastTimestamp;
 }
 
 /// @notice Slotting with Harberger Tax.
+/// @notice Monetize global, manufacture local
 /// @author audsssy.eth
 contract SlotBerger {
     /* -------------------------------------------------------------------------- */
@@ -21,48 +44,38 @@ contract SlotBerger {
     /* -------------------------------------------------------------------------- */
 
     /// @dev Emitted when new `Slot` is set.
-    event Slotted(
-        uint256 indexed id,
-        uint256 indexed newPrice,
-        string indexed slot
-    );
+    event Slotted(uint256 indexed id, uint256 indexed tax, string indexed slot);
 
     /* -------------------------------------------------------------------------- */
     /*                                   Error.                                   */
     /* -------------------------------------------------------------------------- */
 
+    error Paused();
     error Unauthorized();
     error NotAvailable();
-    error InvalidCurrentPrice();
-    error InvalidNewPrice();
+    error InvalidPrice();
     error TransferFailed();
-    error NothingToCollect();
+    error NoBidsToProcess();
     error InvalidCurrency();
 
     /* -------------------------------------------------------------------------- */
     /*                                  Storage.                                  */
     /* -------------------------------------------------------------------------- */
 
-    /// @dev Address authorized to `collect` and `pull`.
+    /// @dev Address authorized to manage `acceptedCurrencies`.
     address public dao;
-
-    /// @dev Percentage of ad price to collect as tax, e.g., 100 / 10000
-    uint40 public tax;
-
-    /// @dev Bidding cycle in seconds.
-    uint40 public cycle;
-
-    /// @dev Minimum increase required to `use()` a slot.
-    uint40 public minimum;
 
     /// @dev Id for slot.
     uint256 public slotId;
 
     /// @dev Mapping of `Slot` by `slotId`.
-    mapping(uint256 id => Slot) slots;
+    mapping(uint256 => Slot) slots;
 
-    /// @dev Mapping of currencies accepted by `dao`.
-    mapping(address currency => bool) public accepted;
+    /// @dev Mapping of highest `Bid` by `slotId`.
+    mapping(uint256 => Bid) bids;
+
+    /// @dev Mapping of permitted currencies.
+    mapping(address => bool) public acceptedCurrencies;
 
     /* -------------------------------------------------------------------------- */
     /*                          Constructors & Modifier.                          */
@@ -70,18 +83,10 @@ contract SlotBerger {
 
     constructor(address _dao) {
         dao = _dao;
-
-        /// @dev Auto-accept ether as payment method.
-        accepted[address(0)] = true;
-
-        /// @dev Hardcoding for demo purposes. You may customize it.
-        tax = 100; // 100 / 10000
-        cycle = 1 minutes;
-        // minimum = 0; // minimum rate of increase per purchase
+        acceptedCurrencies[address(0)] = true;
     }
 
-    /// @dev Modifier to check if `msg.sender` is `dao`.
-    modifier authorized() {
+    modifier onlyDao() {
         if (msg.sender != dao) revert Unauthorized();
         _;
     }
@@ -90,85 +95,125 @@ contract SlotBerger {
     /*                                 Use a Slot.                                */
     /* -------------------------------------------------------------------------- */
 
-    /// @dev Use a slot.
-    function use(
+    /// @dev Set up a slot.
+    function setup(
         uint256 id,
         string calldata content,
         address currency,
-        uint256 currentPrice,
-        uint256 newPrice
+        uint8 tax,
+        uint40 term
     ) public payable {
         if (id == 0) {
-            // Check approved `currency`.
-            if (accepted[currency]) revert InvalidCurrency();
-
-            // Must deposit full tax amount.
-            if ((newPrice * tax) / 10000 != msg.value) revert InvalidNewPrice();
-
+            // Setup a new slot.
+            if (!acceptedCurrencies[currency]) revert InvalidCurrency();
             unchecked {
-                ++slotId;
+                setSlot(++slotId, content, currency, tax, term);
             }
-
-            setSlot(slotId, content, currency, newPrice);
         } else {
+            // Update a slot.
             Slot memory $ = slots[id];
-
-            // Check bidding cycle.
-            if ($.timeLastSlotted + cycle > block.timestamp) {
-                revert NotAvailable();
-            }
-
-            // Check `currentPrice` and `newPrice` conditions.
-            if (currentPrice != $.price) {
-                revert InvalidCurrentPrice();
-            }
-            if (newPrice < currentPrice + (currentPrice * minimum) / 10000) {
-                revert InvalidNewPrice();
-            }
-
-            // Must deposit full tax amount.
-            if ((newPrice * tax) / 10000 != msg.value - currentPrice)
-                revert InvalidNewPrice();
-
-            // Check `currency`.
-            if ($.currency != currency) revert InvalidCurrency();
-
-            // Calculate collection for buyout.
-            uint256 collection = taxToCollect($.price, $.timeTaxLastCollected);
-
-            // Take collection.
-            route(currency, address(this), dao, collection);
-
-            // Refund.
-            route(currency, address(this), $.user, $.deposit - collection);
-
-            setSlot(id, content, currency, newPrice);
+            if ($.owner != msg.sender) revert Unauthorized();
+            if ($.user != address(0)) revert NotAvailable();
+            updateSlot(id, currency, tax, term);
         }
+    }
+
+    /// @dev Acquire rights to a slotted content.
+    function acquire(
+        uint256 id,
+        address currency,
+        uint256 price
+    ) public payable {
+        // Check if in use.
+        Slot storage $ = slots[id];
+        if ($.user != address(0)) revert NotAvailable();
+
+        // Check `currency`.
+        if (!acceptedCurrencies[currency]) revert InvalidCurrency();
+
+        // Route price.
+        route(currency, msg.sender, $.owner, price);
+
+        // Deposit patronage.
+        uint256 patronage = (price * $.tax) / 10000;
+        route(currency, msg.sender, address(this), patronage);
+
+        // Set data.
+        $.remainingTime = $.term;
+        $.lastTimestamp = uint40(block.timestamp);
+        $.deposit = patronage;
+        $.user = msg.sender;
+    }
+
+    /// @dev Bid on rights to a slotted content.
+    function bid(uint256 id, address currency, uint256 price) public {
+        Slot storage $ = slots[id];
+        if ($.price + ($.price * $.tax) / 10000 >= price) revert InvalidPrice();
+
+        Bid storage $bid = bids[id];
+        if ($bid.price > price) revert InvalidPrice();
+
+        // Deposit bid.
+        route(currency, msg.sender, address(this), price);
+
+        // Set bid.
+        $bid.price = price;
+        $bid.currency = currency;
+        $bid.user = msg.sender;
+    }
+
+    function processBid(uint256 id) public {
+        Slot storage $ = slots[id];
+        if ($.lastTimestamp + $.remainingTime > block.timestamp)
+            revert NotAvailable();
+
+        Bid storage $bid = bids[id];
+        if ($bid.user == address(0)) revert NotAvailable();
+        uint256 deposit = ($bid.price * $.tax) / 10000;
+        route($bid.currency, address(this), $.owner, $bid.price - deposit);
+
+        $.user = $bid.user;
+        $.deposit = deposit;
+        $.currency = $bid.currency;
+        $.lastTimestamp = uint40(block.timestamp);
+        $.remainingTime = $.term;
     }
 
     /// @dev Internal function to set slot.
     function setSlot(
         uint256 id,
-        string calldata content,
+        string memory content,
         address currency,
-        uint256 newPrice
+        uint8 tax,
+        uint40 term
     ) internal {
-        // Set slot.
-        slots[id] = Slot({
-            content: content,
-            price: newPrice,
-            deposit: msg.value,
-            user: msg.sender,
-            currency: currency,
-            timeLastSlotted: uint40(block.timestamp),
-            timeTaxLastCollected: uint40(block.timestamp)
-        });
+        Slot storage $ = slots[id];
+        $.content = content;
+        $.owner = msg.sender;
+        $.currency = currency;
+        $.tax = tax;
+        $.term = term;
 
-        emit Slotted(id, newPrice, content);
+        emit Slotted(id, tax, content);
     }
 
+    /// @dev Internal function to set slot.
+    function updateSlot(
+        uint256 id,
+        address currency,
+        uint8 tax,
+        uint40 term
+    ) internal {
+        Slot storage $ = slots[id];
+        $.owner = msg.sender;
+        $.currency = currency;
+        $.tax = tax;
+        $.term = term;
+
+        emit Slotted(id, tax, "");
+    }
     /* -------------------------------------------------------------------------- */
-    /*                           Public Functions.                                */
+    /*                                 Get a Slot.                                */
     /* -------------------------------------------------------------------------- */
 
     /// @dev Retrieve the contents of a slot.
@@ -176,93 +221,78 @@ contract SlotBerger {
         return slots[id];
     }
 
-    /// @dev Public function to calculate amount of tax to collect.
-    // credit: simondlr  https://github.com/simondlr/thisartworkisalwaysonsale/blob/master/packages/hardhat/contracts/v1/ArtStewardV2.sol
-    function taxToCollect(
-        uint256 price,
-        uint256 timeTaxLastCollected
-    ) public view returns (uint256) {
-        return
-            ((price * (block.timestamp - timeTaxLastCollected)) * tax) /
-            10000 /
-            365 days;
+    /* -------------------------------------------------------------------------- */
+    /*                                   Owner.                                   */
+    /* -------------------------------------------------------------------------- */
+
+    /// @dev Pull a given `Slot`.
+    function pull(uint256 id) public payable {
+        Slot storage $ = slots[id];
+        if (msg.sender != $.owner) revert Unauthorized();
+        if ($.lastTimestamp + $.remainingTime > block.timestamp)
+            revert NotAvailable();
+
+        // todo. check if works with pause()
+        uint256 timePassed = uint40(block.timestamp) - $.lastTimestamp;
+        uint256 patronage = patronageOwed($.price, $.tax, timePassed, $.term);
+        route($.currency, address(this), address(this), patronage);
+
+        // Delete slot.
+        delete slots[id];
+    }
+
+    /// @dev Pause/unpause a given `Slot`.
+    function pause(uint256 id) public payable {
+        Slot storage $ = slots[id];
+        if (msg.sender != $.owner) revert Unauthorized();
+        if ($.user == address(0)) revert NotAvailable();
+
+        if (!$.paused) {
+            uint256 timePassed = uint40(block.timestamp) - $.lastTimestamp;
+            uint256 patronage = patronageOwed(
+                $.price,
+                $.tax,
+                timePassed,
+                $.term
+            );
+            route($.currency, address(this), address(this), patronage);
+            $.deposit -= patronage;
+        }
+        if ($.paused) $.lastTimestamp = uint40(block.timestamp);
+        $.paused = !$.paused;
     }
 
     /* -------------------------------------------------------------------------- */
     /*                                    DAO.                                    */
     /* -------------------------------------------------------------------------- */
 
-    /// @dev Collect any tax owed from a slot.
-    function collect(
-        uint256 id
-    ) public payable authorized returns (uint256, uint256) {
-        Slot memory $ = slots[id];
-        uint256 collection = taxToCollect($.price, $.timeTaxLastCollected);
-
-        if (collection > 0) {
-            slots[id].timeTaxLastCollected = uint40(block.timestamp);
-
-            if (collection >= $.deposit) {
-                // Foreclose.
-                delete slots[id];
-
-                // Take deposit.
-                route($.currency, address(this), dao, $.deposit);
-                return ($.deposit, 0);
-            } else {
-                // Take collection.
-                route($.currency, address(this), dao, collection);
-                return (collection, slots[id].deposit = $.deposit - collection);
-            }
-        } else {
-            return (0, 0);
-        }
-    }
-
-    /// @dev Pull a given slot by id.
-    function pull(uint256 id) public payable authorized {
-        Slot memory $ = slots[id];
-
-        // Make collection, if any.
-        (, uint256 refund) = collect(id);
-
-        // Delete slot.
-        delete slots[id];
-
-        // Refund.
-        if (refund > 0) {
-            (bool success, ) = $.user.call{value: refund}("");
-            if (!success) revert TransferFailed();
-        }
-    }
-
-    /// @dev Permissioned function to set `dao`.
-    function setDao(address _dao) public payable authorized {
+    function setDao(address _dao) public payable onlyDao {
         dao = _dao;
     }
 
-    /// @dev Permissioned function to manage slot properties.
-    function manageSetting(
-        uint40 _tax,
-        uint40 _cycle,
-        uint40 _minimum
-    ) public payable authorized {
-        tax = _tax;
-        cycle = _cycle;
-        minimum = _minimum;
-    }
-
-    /// @dev Permissioned function to set an accepted currency.
     function manageCurrency(
         address currency,
         bool status
-    ) public payable authorized {
-        accepted[currency] = status;
+    ) public payable onlyDao {
+        acceptedCurrencies[currency] = status;
     }
 
     /* -------------------------------------------------------------------------- */
     /*                                   Helper.                                  */
     /* -------------------------------------------------------------------------- */
+
+    /// @dev Helper function to calculate patronage owed.
+    // credit: simondlr  https://github.com/simondlr/thisartworkisalwaysonsale/blob/master/packages/hardhat/contracts/v1/ArtStewardV2.sol
+    function patronageOwed(
+        uint256 price,
+        uint256 tax,
+        uint256 timePassed,
+        uint256 term
+    ) private pure returns (uint256 patronage) {
+        uint256 totalPatronage = (price * tax) / 10000;
+        uint256 usageInPercentage = (timePassed * 100) / term / 100;
+        return totalPatronage * usageInPercentage;
+    }
 
     /// @dev Helper function to route ether and ERC20 tokens.
     function route(
